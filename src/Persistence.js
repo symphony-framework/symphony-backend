@@ -17,13 +17,14 @@ class Persistence {
   }
 
   async getState(docName) {
-    let room;
 
-    if (!Persistence.activeRooms[docName]) {
-      room = await this.getRoom(docName);
+    // update metadata
+    try {
+      const room = await this.getRoom(docName);
+
       if (!room) {
         await this.createRoom(docName);
-        Persistence.activeRooms[docName] = true;
+        // Persistence.activeRooms[docName] = true;
 
         // no state data in s3 yet
         return null;
@@ -32,6 +33,10 @@ class Persistence {
       if (!room.active) {
         await this.setActive(docName, true);
       }
+      // let room;
+
+    } catch(err) {
+      console.log("Metadata failed to update");
     }
 
     let params = {
@@ -45,7 +50,7 @@ class Persistence {
       let data = await this.s3.send(command);
       return await data.Body.transformToByteArray();
     } catch (err) {
-      console.log(err);
+      return;
     }
   }
 
@@ -93,7 +98,7 @@ class Persistence {
   }
 
   async setActive(docName, active) {
-    Persistence.activeRooms[docName] = active;
+    // Persistence.activeRooms[docName] = active;
     
     try {
       await pgExecute(async () => {

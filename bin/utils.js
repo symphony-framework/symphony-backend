@@ -15,9 +15,9 @@ const isCallbackSet = require('./callback.js').isCallbackSet
 
 const { pg, pgExecute } = require("../src/PostgresClient");
 
-const { docs, dashboard } = require("../server.config.js");
+const { docs, dashboard, snapshotDelay } = require("../server.config.js");
 
-const {pub, sub} = require("./redis.js");
+const redisCluster = require("./redis.js");
 const getDocState = require("./getDocState.js");
 
 const { getRoomIps, updateRoomIps, deleteRoomIp } = require("../src/DynamoClient.js")
@@ -43,6 +43,14 @@ const storage = new Persistence();
 const persistence = {
   provider: storage,
   bindState: async (docName, ydoc) => {
+    await redisCluster.sub.sSubscribe(docName, (update, channel) => {
+      Y.applyUpdate(this, update);
+    }, true);
+
+    await redisCluster.sub.sSubscribe(`${docName}-sympresence`, (update, channel) => {
+      awarenessProtocol.applyAwarenessUpdate(this.awareness, update);
+    }, true);
+    
     // array of ip addresses of servers with the doc in memory or null
     let remoteServers
     try {
@@ -104,9 +112,6 @@ const persistence = {
         if (attempts === 3) throw new Error("failed to save ip to dynamo");
       }
     }
-
-    // let state = Y.encodeStateAsUpdate(ydoc);
-    // await storage.storeState(docName, state);
   },
   writeState: async (docName, ydoc) => {
     let state = Y.encodeStateAsUpdate(ydoc);
@@ -142,7 +147,7 @@ const updateHandler = (update, origin, doc) => {
   let local = origin instanceof WebSocket && doc.conns.has(origin);
 
   if (local) {
-    pub.publishBuffer(doc.name, Buffer.from(update));
+    redisCluster.pub.sPublish(doc.name, Buffer.from(update));
   }
 
   updateLocalClients(update, doc);
@@ -152,7 +157,7 @@ class WSSharedDoc extends Y.Doc {
   constructor(name) {
     super({ gc: gcEnabled })
     this.name = name;
-    this.presenceChannel = `${name}-presence`;
+    this.presenceChannel = `${name}-sympresence`;
  
     this.conns = new Map();
     this.awareness = new awarenessProtocol.Awareness(this)
@@ -182,22 +187,12 @@ class WSSharedDoc extends Y.Doc {
     this.awareness.on('update', broadcastAwarenessLocal)
     this.on('update', updateHandler)
 
-    // subscribe to presence and update channel
-    sub.subscribe([this.name, this.presenceChannel]).then(() => {
-      sub.on('messageBuffer', (channel, update) => {
-        const docName = channel.toString();
-
-        if (docName === this.name) {
-          Y.applyUpdate(this, update, sub);
-          return 
-        }
-
-        if (docName === this.presenceChannel) {
-          awarenessProtocol.applyAwarenessUpdate(this.awareness, update, sub);
-        }
-      })
-    })
-
+    // // snapshots
+    // this.snapshotInterval = setInterval(() => {
+    //   let state = Y.encodeStateAsUpdate(this);
+    //   storage.storeState(this.name, state);
+    // }, snapshotDelay);
+    
     if (isCallbackSet) {
       this.on('update', debounce(
         callbackHandler,
@@ -209,10 +204,14 @@ class WSSharedDoc extends Y.Doc {
 
   async destroy() {
     const docName = this.name;
+    const presenceChannel = this.presenceChannel
     super.destroy();
 
     await deleteRoomIp(docName);
-    sub.unsubscribe(docName);    
+    
+    await redisCluster.sub.sUnsubscribe(presenceChannel);
+    await redisCluster.sub.sUnsubscribe(docName);
+
     docs.delete(docName)
   }
 }
@@ -231,6 +230,7 @@ const getYDoc = (docname, gc = true) => map.setIfUndefined(docs, docname, () => 
   persistence.bindState(docname, doc)
 
   docs.set(docname, doc);
+
   return doc;
 })
 
@@ -258,7 +258,7 @@ const messageListener = (conn, doc, message) => {
         const update = decoding.readVarUint8Array(decoder);
 
         // publish awareness update to presence channel
-        pub.publish(doc.presenceChannel, Buffer.from(update));
+        redisCluster.pub.sPublish(doc.presenceChannel, Buffer.from(update));
 
         awarenessProtocol.applyAwarenessUpdate(doc.awareness, update, conn);
         
@@ -281,6 +281,9 @@ const closeConn = async(doc, conn) => {
     
     if (doc.conns.size === 0) {
       
+      // clear snapshots
+      // clearInterval(doc.snapshotInterval);
+
       // if persisted, we store state and destroy ydocument
       persistence.writeState(doc.name, doc).then(() => {
         doc.destroy()
@@ -344,15 +347,15 @@ exports.setupWSConnection = (conn, req, { docName = req.url.slice(1).split('?')[
         conn.ping()
       } catch (e) {
         console.log('error: ', e)
-        closeConn(doc, conn)
         clearInterval(pingInterval)
+        closeConn(doc, conn)
       }
     }
   }, pingTimeout)
 
   conn.on('close', () => {
-    closeConn(doc, conn)
     clearInterval(pingInterval)
+    closeConn(doc, conn)
   })
 
   conn.on('pong', () => {

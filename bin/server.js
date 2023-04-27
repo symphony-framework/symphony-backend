@@ -10,14 +10,12 @@ const http = require('http')
 const WebSocket = require('ws')
 
 const SERVER = require("../server.config.js");
+const { initRedis } = require("./redis.js"); 
 
 const dashboardRouter = require("../src/routes/dashboard.js");
 const roomRouter = require("../src/routes/room.js");
-
 const setDashboardStatus = require('./dashboard_utils/setDashboardStatus.js')
-
 const getContainerIp = require("./aws_utils/getContainerIp.js");
-const { execSync } = require("child_process");
 
 const httpServer = http.createServer();
 
@@ -33,8 +31,7 @@ wss.on('connection', setupWSConnection)
 httpServer.on('upgrade', (request, socket, head) => {
 
   const handleAuth = ws => {
-    console.log({clients: wss.clients.size})
-
+    console.log({connections: wss.clients.size});
     wss.emit('connection', ws, request)
   }
   wss.handleUpgrade(request, socket, head, handleAuth)
@@ -43,20 +40,15 @@ httpServer.on('upgrade', (request, socket, head) => {
 httpServer.on('request', (req, res) => {
   const {url, method} = req;
 
-  console.log("http req", {url, method})
   if (url.startsWith("/api")) {
     const restPath = url.split("/api")[1];
 
-    console.log({restPath});
-
     if (restPath === "/dashboard") {
-      console.log("going to dashboard router")
       dashboardRouter(req, res);
       return;
     }
 
     if (restPath.startsWith("/room")) {
-      console.log("going to room router");
       roomRouter(req, res);
       return;
     }
@@ -77,10 +69,13 @@ httpServer.on('request', (req, res) => {
 
 
 httpServer.listen(port, host, async() => {
-  console.log("final pubsub server")
+  console.log("final pubsub server v3 - sharded pubsub")
 
   // save container IP in memory on startup
   SERVER.ip = await getContainerIp();
   // activate dashboard status on startup if active
   await setDashboardStatus();
+
+  console.log("initializing redis");
+  await initRedis();
 });
